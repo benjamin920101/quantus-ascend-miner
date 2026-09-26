@@ -1,0 +1,173 @@
+name: Build Quantus Ascend Miner
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: quantus-ascend-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # CANN 9.1.0 (aarch64) — same mirror style as ascend_kas
+  CANN_INSTALLER: Ascend-cann-toolkit_9.1.0_linux-aarch64.run
+  CANN_URL: https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/legacy/20260720000024864/Ascend-cann-toolkit_9.1.0_linux-aarch64.run
+
+jobs:
+  # ------------------------------------------------------------------
+  # Job 1: Host-only skeleton (x86_64, no CANN) — always runs
+  # ------------------------------------------------------------------
+  build-host:
+    name: Build Host (CPU Poseidon2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Configure & Build
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      - name: Check binary
+        run: |
+          ls -la build/quantus_ascend_miner
+          file build/quantus_ascend_miner
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quantus-ascend-miner-linux-x86_64
+          path: build/quantus_ascend_miner
+
+  # ------------------------------------------------------------------
+  # Job 2: Full build with CANN 9.1.0 on aarch64 (like ascend_kas)
+  # ------------------------------------------------------------------
+  build-with-cann:
+    name: Build with CANN 9.1.0 (aarch64)
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang pkg-config wget file binutils
+
+      - name: Install CANN 9.1.0
+        run: |
+          set -euxo pipefail
+          echo "Downloading CANN 9.1.0 from Huawei mirror..."
+          wget -q "$CANN_URL" -O "$CANN_INSTALLER"
+          chmod +x "$CANN_INSTALLER"
+          echo "Installing CANN (this may take several minutes)..."
+          bash "./$CANN_INSTALLER" --install --quiet
+          rm -f "$CANN_INSTALLER"
+          echo "CANN install finished."
+
+      - name: Source CANN env & Build host + kernel
+        shell: bash
+        run: |
+          set -eo pipefail
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+
+          # Locate set_env.sh (same search order as ascend_kas)
+          for f in \
+            "$HOME/Ascend/cann/set_env.sh" \
+            "$HOME/Ascend/ascend-toolkit/set_env.sh" \
+            "$HOME/Ascend/ascend-toolkit/latest/set_env.sh" \
+            "$HOME/Ascend/ascend-toolkit/latest/bin/setenv.bash" \
+            /usr/local/Ascend/cann/set_env.sh \
+            /usr/local/Ascend/ascend-toolkit/set_env.sh \
+            /usr/local/Ascend/ascend-toolkit/latest/set_env.sh \
+            /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash; do
+            if [[ -f "$f" ]]; then
+              echo "Sourcing $f"
+              # shellcheck source=/dev/null
+              source "$f"
+              break
+            fi
+          done
+
+          # Optional: FindASC.cmake for Ascend C kernel builds
+          if [[ -z "${ASC_MODULES:-}" ]]; then
+            FIND_ASC="$(find "$HOME/Ascend" /usr/local/Ascend -type f -name FindASC.cmake -print -quit 2>/dev/null || true)"
+            if [[ -n "$FIND_ASC" ]]; then
+              export ASC_MODULES="$(dirname "$FIND_ASC")"
+              echo "ASC_MODULES=$ASC_MODULES"
+            fi
+          fi
+
+          echo "ASCEND_HOME=${ASCEND_HOME:-unset}"
+          echo "ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-unset}"
+
+          # Host binary (Poseidon2 + Stratum) always builds
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+          cd ..
+
+          # If Ascend C / kernel toolchain is present, attempt kernel compile
+          if [[ -n "${ASC_MODULES:-}" ]] && [[ -f kernel/quantus_qpow_kernel.cpp ]]; then
+            echo "Attempting Ascend C kernel build..."
+            mkdir -p kernel/build
+            # Placeholder: real project would use cmake with ASC modules
+            # and ccec/bisheng. Keep non-fatal for now.
+            echo "Kernel path present; full NPU kernel CI can be extended here."
+          else
+            echo "ASC_MODULES not found or no kernel source — host-only build."
+          fi
+
+          test -s build/quantus_ascend_miner
+          file build/quantus_ascend_miner
+
+      - name: Package
+        id: package
+        run: |
+          set -euxo pipefail
+          TAG="v0.2.0-prerelease.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          ARCHIVE="quantus-ascend-miner-${TAG}-linux-aarch64.tar.gz"
+          mkdir -p dist
+          cp build/quantus_ascend_miner dist/
+          tar -czf "dist/$ARCHIVE" -C dist quantus_ascend_miner
+          (cd dist && sha256sum "$ARCHIVE" quantus_ascend_miner > SHA256SUMS)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quantus-ascend-miner-linux-aarch64-${{ github.run_number }}
+          path: |
+            build/quantus_ascend_miner
+            dist/
+
+      # Optional pre-release (only on workflow_dispatch / main)
+      - name: Pre-release
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if command -v gh >/dev/null 2>&1; then
+            gh release create "${{ steps.package.outputs.tag }}" \
+              "dist/${{ steps.package.outputs.archive }}" \
+              dist/quantus_ascend_miner dist/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "quantus-ascend-miner ${{ steps.package.outputs.tag }} (Linux AArch64 + CANN 9.1.0)" \
+              --prerelease --generate-notes || true
+          else
+            echo "gh CLI not available, skip release"
+          fi
